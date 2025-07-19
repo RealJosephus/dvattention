@@ -1,0 +1,25 @@
+[build-system]
+requires = ["scikit-build-core"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "dvattn"
+version = "0.0.1"
+description = "Dynamic View Attention"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.scikit-build]
+metadata.dependencies = {provider = "metadata_provider", provider-path = "."} # Local
+experimental = true
+wheel.py-api = "cp310"
+build-dir = "build/{wheel_tag}"
+build.targets = ["dvatt"]
+
+[tool.scikit-build.wheel.packages]
+"dvattn" = "python/dvattn"
+
+[tool.scikit-build.cmake.define]
+DVATTN_TORCH_BINDINGS = "ON"
+DVATTN_BENCHMARKS = "OFF"
+DVATTN_TESTS = "OFF"

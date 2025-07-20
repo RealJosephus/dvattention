@@ -29,6 +29,7 @@ template<int E, int Ev, int GQA, class scalar_t>
 __global__ __launch_bounds__(256) void dvattn_attention_gpu_kernel21(
         scalar_t* out, char* workspace, float scale,
         const int* locations, const scalar_t* queries,
+        const float* cosines, const float* sines, int rotary_dim,
         const int* fragment_lengths,
         const scalar_t* const* key_fragments,
         const scalar_t* const* value_fragments,
@@ -319,6 +320,7 @@ template<int E, int Ev, int GQA, class scalar_t>
 __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
         scalar_t* out, char* workspace, float scale,
         const int* locations, const scalar_t* queries,
+        const float* cosines, const float* sines, int rotary_dim,
         const int* fragment_lengths, // Corresponds to sequence lengths
         const scalar_t* key_cache,
         const scalar_t* value_cache,
@@ -326,8 +328,8 @@ __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
         Shape shape) {
     // Input:   key_cache/value_cache: [NumBlocks, Hkv, BlockSize, E/Ev]
     //          block_table: [W, max_blocks_per_seq]  (W is batch size)
-    //          queries: [F, W, Hq, S, E]
-    //          locations [F, W, S]
+    //          queries: [W, Hq, S, E]
+    //          locations/cosines/sines: [F, W, S, ...]
     // Output:  [W, Hq, S, Ev]
 
     int W = shape.W;
@@ -343,7 +345,6 @@ __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
     auto sub_warp = cg::tiled_partition<SubWarpSize>(block);
     constexpr const int SubWarpMetaSize = 256 / SubWarpSize;
 
-    ptrdiff_t q_stride = E * S * Hq * W;
     extern __shared__ float scratch[];
 
     // adjust scale so we can use base-2 exponent later on
@@ -356,7 +357,6 @@ __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
     int splits = gridDim.z;
 
     int hq = hkv * GQA;
-    ptrdiff_t q_offset = ((w * Hq + hq) * S + s) * E;
 
     constexpr const int VecSize = 16 / sizeof(scalar_t);
     constexpr int VPH_k = E / (SubWarpSize * VecSize);   // vectors per head per thread
@@ -364,8 +364,23 @@ __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
 
     using full_vec_t = GenericVector<scalar_t, VecSize>;
     using full_fvec_t = GenericVector<float, VecSize>;
-    using qk_cache_t = GenericVector<float, E / SubWarpSize>;
-    qk_cache_t q_cache[GQA];
+    using qk_cache_t = GenericVector<float, E / SubWarpSize>; // E / 8
+
+    // Load unrotated query once
+    qk_cache_t unrotated_q_cache[GQA];
+    ptrdiff_t q_base_offset = ((w * Hq + hq) * S + s) * E;
+
+    #pragma unroll
+    for (int gqa = 0; gqa < GQA; ++gqa) {
+        #pragma unroll
+        for (int ee = 0; ee < VPH_k; ++ee) {
+            full_vec_t qv = full_vec_t::load(queries + q_base_offset + gqa * S * E + (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize);
+            #pragma unroll
+            for(int v=0; v < VecSize; ++v) {
+                unrotated_q_cache[gqa][ee * VecSize + v] = (float)qv[v];
+            }
+        }
+    }
 
     // combine values
     using v_cache_t = GenericVector<float, Ev / SubWarpSize>;
@@ -387,12 +402,40 @@ __global__ __launch_bounds__(256) void dvattn_paged_attention_gpu_kernel21(
             int L = fragment_lengths[f];
             int maxL = std::min(L, q_loc + 1);
 
+            qk_cache_t q_cache[GQA];
+            const float* cos_ptr = cosines + ((f * W + w) * S + s) * rotary_dim;
+            const float* sin_ptr = sines + ((f * W + w) * S + s) * rotary_dim;
+
+            #pragma unroll
             for (int gqa = 0; gqa < GQA; ++gqa) {
+                #pragma unroll
                 for (int ee = 0; ee < VPH_k; ++ee) {
-                    int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize;
-                    full_vec_t qv = full_vec_t::load(queries + f * q_stride + q_offset + gqa * S * E + e);
-                    for (int j = 0; j < VecSize; ++j) {
-                        q_cache[gqa][ee * VecSize + j] = qv[j];
+                    #pragma unroll
+                    for (int v = 0; v < VecSize; ++v) {
+                        int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize + v;
+                        float val = unrotated_q_cache[gqa][ee * VecSize + v];
+
+                        if (e >= rotary_dim) {
+                            q_cache[gqa][ee * VecSize + v] = val;
+                            continue;
+                        }
+
+                        int e_pair = (e < rotary_dim / 2) ? (e + rotary_dim / 2) : (e - rotary_dim / 2);
+                        int pair_sub_warp_rank = (e_pair / VecSize) % SubWarpSize;
+                        int pair_ee = e_pair / (SubWarpSize * VecSize);
+                        int pair_v = e_pair % VecSize;
+
+                        float pair_val = __shfl_sync(0xffffffff, unrotated_q_cache[gqa][pair_ee * VecSize + pair_v], pair_sub_warp_rank, SubWarpSize);
+
+                        if (e < rotary_dim / 2) {
+                            float cos_val = __ldg(cos_ptr + e);
+                            float sin_val = __ldg(sin_ptr + e);
+                            q_cache[gqa][ee * VecSize + v] = val * cos_val - pair_val * sin_val;
+                        } else {
+                            float cos_val = __ldg(cos_ptr + e_pair);
+                            float sin_val = __ldg(sin_ptr + e_pair);
+                            q_cache[gqa][ee * VecSize + v] = val * cos_val + pair_val * sin_val;
+                        }
                     }
                 }
             }
@@ -659,6 +702,7 @@ template<int E, int Ev, int GQA, class scalar_t>
 __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel21(
         scalar_t* out, char* workspace, float scale,
         const int* locations, const scalar_t* queries,
+        const float* cosines, const float* sines, int rotary_dim,
         const int* fragment_lengths, // Corresponds to sequence lengths
         const scalar_t* key_cache,
         const scalar_t* value_cache,
@@ -666,8 +710,8 @@ __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel2
         Shape shape) {
     // Varlen version of paged attention kernel.
     // Grid.y is total_q_tokens.
-    // queries: [F, total_q_tokens, Hq, E]
-    // locations: [F, total_q_tokens]
+    // queries: [total_q_tokens, Hq, E]
+    // locations/cosines/sines: [F, total_q_tokens, ...]
 
     int W = shape.W;
     int Hq = shape.Hq;
@@ -695,8 +739,8 @@ __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel2
     find_seq_idx(w, s, global_q_idx, shape.cu_seqlens_q, W);
 
     int hq = hkv * GQA;
-    // queries are packed: [F, total_q_tokens, Hq, E]
-    ptrdiff_t q_base_offset = (global_q_idx * Hq + hq) * E;
+    // queries are packed: [total_q_tokens, Hq, E]
+    ptrdiff_t q_base_offset = ((ptrdiff_t)global_q_idx * Hq + hq) * E;
 
     constexpr const int VecSize = 16 / sizeof(scalar_t);
     constexpr int VPH_k = E / (SubWarpSize * VecSize);
@@ -705,11 +749,25 @@ __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel2
     using full_vec_t = GenericVector<scalar_t, VecSize>;
     using full_fvec_t = GenericVector<float, VecSize>;
     using qk_cache_t = GenericVector<float, E / SubWarpSize>;
-    qk_cache_t q_cache[GQA];
 
     using v_cache_t = GenericVector<float, Ev / SubWarpSize>;
     v_cache_t v_cache[GQA];
     float maximum[GQA];
+
+    // Load unrotated query once before the fragment loop
+    qk_cache_t unrotated_q_cache[GQA];
+    #pragma unroll
+    for (int gqa = 0; gqa < GQA; ++gqa) {
+        #pragma unroll
+        for (int ee = 0; ee < VPH_k; ++ee) {
+            full_vec_t qv = full_vec_t::load(queries + q_base_offset + gqa * E + (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize);
+            #pragma unroll
+            for(int v=0; v < VecSize; ++v) {
+                unrotated_q_cache[gqa][ee * VecSize + v] = (float)qv[v];
+            }
+        }
+    }
+
     for (int gqa = 0; gqa < GQA; ++gqa) {
         v_cache[gqa] = v_cache_t::zeros();
         maximum[gqa] = std::numeric_limits<float>::lowest();
@@ -726,13 +784,36 @@ __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel2
             int L = fragment_lengths[f * W + w]; // fragment_lengths is [F, W]
             int maxL = std::min(L, q_loc + 1);
 
+            qk_cache_t q_cache[GQA];
+            const float* cos_ptr = cosines + ((ptrdiff_t)f * total_q_tokens + global_q_idx) * rotary_dim;
+            const float* sin_ptr = sines + ((ptrdiff_t)f * total_q_tokens + global_q_idx) * rotary_dim;
+
+            #pragma unroll
             for (int gqa = 0; gqa < GQA; ++gqa) {
+                #pragma unroll
                 for (int ee = 0; ee < VPH_k; ++ee) {
-                    int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize;
-                    ptrdiff_t q_stride = (ptrdiff_t)total_q_tokens * Hq * E;
-                    full_vec_t qv = full_vec_t::load(queries + f * q_stride + q_base_offset + gqa * E + e);
-                    for (int j = 0; j < VecSize; ++j) {
-                        q_cache[gqa][ee * VecSize + j] = qv[j];
+                    #pragma unroll
+                    for (int v = 0; v < VecSize; ++v) {
+                        int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize + v;
+                        float val = unrotated_q_cache[gqa][ee * VecSize + v];
+
+                        if (e >= rotary_dim) {
+                            q_cache[gqa][ee * VecSize + v] = val;
+                            continue;
+                        }
+
+                        int e_pair = (e < rotary_dim / 2) ? (e + rotary_dim / 2) : (e - rotary_dim / 2);
+                        int pair_sub_warp_rank = (e_pair / VecSize) % SubWarpSize;
+                        int pair_ee = e_pair / (SubWarpSize * VecSize);
+                        int pair_v = e_pair % VecSize;
+
+                        float pair_val = __shfl_sync(0xffffffff, unrotated_q_cache[gqa][pair_ee * VecSize + pair_v], pair_sub_warp_rank, SubWarpSize);
+
+                        if (e < rotary_dim / 2) {
+                            q_cache[gqa][ee * VecSize + v] = val * __ldg(cos_ptr + e) - pair_val * __ldg(sin_ptr + e);
+                        } else {
+                            q_cache[gqa][ee * VecSize + v] = val * __ldg(cos_ptr + e_pair) + pair_val * __ldg(sin_ptr + e_pair);
+                        }
                     }
                 }
             }
@@ -951,6 +1032,7 @@ __global__ __launch_bounds__(32) void dvattn_varlen_attention_reduce_kernel(
 template<class scalar_t>
 cudaError_t dvattn_attention_gpu(scalar_t* out, float scale,
                            const int* locations, const scalar_t* queries,
+                           const float* cosines, const float* sines, int rotary_dim,
                            const int* fragment_lengths,
                            const scalar_t** key_fragments,
                            const scalar_t** value_fragments,
@@ -983,7 +1065,7 @@ cudaError_t dvattn_attention_gpu(scalar_t* out, float scale,
         CUDA_RETURN_ON_ERROR(cudaFuncSetAttribute(dvattn_attention_gpu_kernel21<128, 128, 16, scalar_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         dvattn_attention_gpu_kernel21<128, 128, 16><<<grid_dim, block_dim, smem>>>(
-                out, workspace, scale, locations, queries, fragment_lengths, key_fragments, value_fragments, shape);
+                out, workspace, scale, locations, queries, cosines, sines, rotary_dim, fragment_lengths, key_fragments, value_fragments, shape);
 
         dim3 r_grid_dim{(unsigned)shape.Hq, (unsigned)shape.W * (unsigned)shape.S, 1};
         dvattn_attention_reduce_kernel<128><<<r_grid_dim, 32>>>(
@@ -998,6 +1080,7 @@ cudaError_t dvattn_attention_gpu(scalar_t* out, float scale,
 template<class scalar_t>
 cudaError_t dvattn_paged_attention_gpu(scalar_t* out, float scale,
                            const int* locations, const scalar_t* queries,
+                           const float* cosines, const float* sines, int rotary_dim,
                            const int* fragment_lengths,
                            const scalar_t* key_cache,
                            const scalar_t* value_cache,
@@ -1030,7 +1113,7 @@ cudaError_t dvattn_paged_attention_gpu(scalar_t* out, float scale,
         CUDA_RETURN_ON_ERROR(cudaFuncSetAttribute(dvattn_paged_attention_gpu_kernel21<128, 128, 16, scalar_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         dvattn_paged_attention_gpu_kernel21<128, 128, 16><<<grid_dim, block_dim, smem>>>(
-                out, workspace, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, shape);
+                out, workspace, scale, locations, queries, cosines, sines, rotary_dim, fragment_lengths, key_cache, value_cache, block_table, shape);
 
         dim3 r_grid_dim{(unsigned)shape.Hq, (unsigned)shape.W * (unsigned)shape.S, 1};
         dvattn_attention_reduce_kernel<128><<<r_grid_dim, 32>>>(
@@ -1045,6 +1128,7 @@ cudaError_t dvattn_paged_attention_gpu(scalar_t* out, float scale,
 template<class scalar_t>
 cudaError_t dvattn_varlen_paged_attention_gpu(scalar_t* out, float scale,
                            const int* locations, const scalar_t* queries,
+                           const float* cosines, const float* sines, int rotary_dim,
                            const int* fragment_lengths,
                            const scalar_t* key_cache,
                            const scalar_t* value_cache,
@@ -1073,7 +1157,7 @@ cudaError_t dvattn_varlen_paged_attention_gpu(scalar_t* out, float scale,
     if (shape.E == 128 && shape.Ev == 128 && shape.Hq == shape.Hkv * 16) {
         CUDA_RETURN_ON_ERROR(cudaFuncSetAttribute(dvattn_varlen_paged_attention_gpu_kernel21<128, 128, 16, scalar_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         dvattn_varlen_paged_attention_gpu_kernel21<128, 128, 16><<<grid_dim, block_dim, smem>>>(
-                out, workspace, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, shape);
+                out, workspace, scale, locations, queries, cosines, sines, rotary_dim, fragment_lengths, key_cache, value_cache, block_table, shape);
 
         dim3 r_grid_dim{(unsigned)shape.Hq, (unsigned)shape.total_q_tokens, 1};
         dvattn_varlen_attention_reduce_kernel<128><<<r_grid_dim, 32>>>(

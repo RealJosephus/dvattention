@@ -103,13 +103,14 @@ void dvattn_attention_tpl(
     C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice, stream));
 
     Shape shape = {F, W, Hq, Hkv, E, Ev, S, 0, 0, 0, nullptr, nullptr}; // block_size, max_blocks not used
-    C10_CUDA_CHECK(v21::dvattn_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+    C10_CUDA_CHECK(v21::dvattn_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, nullptr, nullptr, 0, fl_ptr,
                           frag_ptrs, frag_ptrs + F, shape));
 }
 
 template<class scalar_t>
 void dvattn_paged_attention_tpl(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& cosines, const at::Tensor& sines,
         const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
         const at::Tensor& value_cache, const at::Tensor& block_table)
 {
@@ -117,6 +118,8 @@ void dvattn_paged_attention_tpl(
 
     scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
     const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
+    const float* cos_ptr = cosines.const_data_ptr<float>();
+    const float* sin_ptr = sines.const_data_ptr<float>();
     const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
     const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
     const int* loc_ptr = locations.const_data_ptr<int>();
@@ -127,8 +130,8 @@ void dvattn_paged_attention_tpl(
         (int)locations.size(0),       // F
         (int)out.size(0),             // W (batch_size)
         (int)out.size(1),             // Hq
-        (int)key_cache.size(1),       // Hkv
-        (int)queries.size(4),         // E
+        (int)key_cache.size(1),       // Hkv (per replica)
+        (int)queries.size(3),         // E. queries is [W, Hq, S, E]
         (int)out.size(3),             // Ev
         (int)out.size(2),             // S
         (int)key_cache.size(2),       // block_size
@@ -136,14 +139,17 @@ void dvattn_paged_attention_tpl(
         0, nullptr, nullptr
     };
 
+    const int rotary_dim = cosines.size(3);
+
     C10_CUDA_CHECK(v21::dvattn_paged_attention_gpu<scalar_t>(
-        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+        out_ptr, (float)scale, loc_ptr, query_ptr, cos_ptr, sin_ptr, rotary_dim, fl_ptr,
         key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
 }
 
 template<class scalar_t>
 void dvattn_varlen_paged_attention_tpl(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& cosines, const at::Tensor& sines,
         const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
         const at::Tensor& value_cache, const at::Tensor& block_table,
         const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_k)
@@ -152,6 +158,8 @@ void dvattn_varlen_paged_attention_tpl(
 
     scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
     const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
+    const float* cos_ptr = cosines.const_data_ptr<float>();
+    const float* sin_ptr = sines.const_data_ptr<float>();
     const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
     const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
     const int* loc_ptr = locations.const_data_ptr<int>();
@@ -165,7 +173,7 @@ void dvattn_varlen_paged_attention_tpl(
         (int)cu_seqlens_q.size(0) - 1,  // W (batch_size)
         (int)out.size(1),             // Hq
         (int)key_cache.size(1),       // Hkv
-        (int)queries.size(3),         // E
+        (int)queries.size(2),         // E (queries shape: [total_q, Hq, E])
         (int)out.size(2),             // Ev
         0,                            // S (not used in varlen)
         (int)key_cache.size(2),       // block_size
@@ -175,8 +183,10 @@ void dvattn_varlen_paged_attention_tpl(
         cu_seqlens_k_ptr
     };
 
+    const int rotary_dim = cosines.size(2);
+
     C10_CUDA_CHECK(v21::dvattn_varlen_paged_attention_gpu<scalar_t>(
-        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+        out_ptr, (float)scale, loc_ptr, query_ptr, cos_ptr, sin_ptr, rotary_dim, fl_ptr,
         key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
 }
 
@@ -268,30 +278,32 @@ void dvattn_attention(
 
 void dvattn_paged_attention(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& cosines, const at::Tensor& sines,
         const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
         const at::Tensor& value_cache, const at::Tensor& block_table)
 {
     if(out.dtype() == at::kHalf) {
-        dvattn_paged_attention_tpl<half>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
     } else if (out.dtype() == at::kFloat) {
-        dvattn_paged_attention_tpl<float>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
     } else if (out.dtype() == at::kBFloat16) {
-        dvattn_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
     }
 }
 
 void dvattn_varlen_paged_attention(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& cosines, const at::Tensor& sines,
         const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
         const at::Tensor& value_cache, const at::Tensor& block_table,
         const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_k)
 {
     if(out.dtype() == at::kHalf) {
-        dvattn_varlen_paged_attention_tpl<half>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
     } else if (out.dtype() == at::kFloat) {
-        dvattn_varlen_paged_attention_tpl<float>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
     } else if (out.dtype() == at::kBFloat16) {
-        dvattn_varlen_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
     }
 }
 
@@ -366,11 +378,11 @@ TORCH_LIBRARY(libdvatt, m) {
     m.def("dvattn_fused(Tensor(a!) output, Tensor(b!) rq, float scale, Tensor locations, Tensor queries, "
           "Tensor fragment_lengths, Tensor[] key_fragments, Tensor[] value_fragments, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
 
-    m.def("dvattn_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
+    m.def("dvattn_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, Tensor cosines, Tensor sines, "
           "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
     m.def("copy_to_blocks(Tensor key_states, Tensor value_states, Tensor(a!) key_cache, Tensor(b!) value_cache, "
           "Tensor block_table, Tensor seq_lengths) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-    m.def("dvattn_varlen_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
+    m.def("dvattn_varlen_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, Tensor cosines, Tensor sines, "
           "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor cu_seqlens_q, Tensor cu_seqlens_k) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
 
 }

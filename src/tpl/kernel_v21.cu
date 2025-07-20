@@ -7,6 +7,7 @@
 template cudaError_t v21::dvattn_attention_gpu<float>(
     float* out, float scale,
     const int* locations, const float* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const float** key_fragments,
     const float** value_fragments,
@@ -15,6 +16,15 @@ template cudaError_t v21::dvattn_attention_gpu<float>(
 template cudaError_t v21::dvattn_paged_attention_gpu<float>(
     float* out, float scale,
     const int* locations, const float* queries,
+    const float* cosines, const float* sines, int rotary_dim,
+    const int* fragment_lengths,
+    const float* key_cache, const float* value_cache, const int* block_table,
+    Shape shape
+);
+template cudaError_t v21::dvattn_varlen_paged_attention_gpu<float>(
+    float* out, float scale,
+    const int* locations, const float* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const float* key_cache, const float* value_cache, const int* block_table,
     Shape shape
@@ -25,6 +35,7 @@ template cudaError_t v21::dvattn_paged_attention_gpu<float>(
 template cudaError_t v21::dvattn_attention_gpu<half>(
     half* out, float scale,
     const int* locations, const half* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const half** key_fragments,
     const half** value_fragments,
@@ -33,6 +44,15 @@ template cudaError_t v21::dvattn_attention_gpu<half>(
 template cudaError_t v21::dvattn_paged_attention_gpu<half>(
     half* out, float scale,
     const int* locations, const half* queries,
+    const float* cosines, const float* sines, int rotary_dim,
+    const int* fragment_lengths,
+    const half* key_cache, const half* value_cache, const int* block_table,
+    Shape shape
+);
+template cudaError_t v21::dvattn_varlen_paged_attention_gpu<half>(
+    half* out, float scale,
+    const int* locations, const half* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const half* key_cache, const half* value_cache, const int* block_table,
     Shape shape
@@ -43,6 +63,7 @@ template cudaError_t v21::dvattn_paged_attention_gpu<half>(
 template cudaError_t v21::dvattn_attention_gpu<nv_bfloat16>(
     nv_bfloat16* out, float scale,
     const int* locations, const nv_bfloat16* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const nv_bfloat16** key_fragments,
     const nv_bfloat16** value_fragments,
@@ -51,6 +72,15 @@ template cudaError_t v21::dvattn_attention_gpu<nv_bfloat16>(
 template cudaError_t v21::dvattn_paged_attention_gpu<nv_bfloat16>(
     nv_bfloat16* out, float scale,
     const int* locations, const nv_bfloat16* queries,
+    const float* cosines, const float* sines, int rotary_dim,
+    const int* fragment_lengths,
+    const nv_bfloat16* key_cache, const nv_bfloat16* value_cache, const int* block_table,
+    Shape shape
+);
+template cudaError_t v21::dvattn_varlen_paged_attention_gpu<nv_bfloat16>(
+    nv_bfloat16* out, float scale,
+    const int* locations, const nv_bfloat16* queries,
+    const float* cosines, const float* sines, int rotary_dim,
     const int* fragment_lengths,
     const nv_bfloat16* key_cache, const nv_bfloat16* value_cache, const int* block_table,
     Shape shape

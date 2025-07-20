@@ -33,3 +33,44 @@ void rope_cpu(scalar_t* rotated_queries, const scalar_t* queries, const float* c
         }
     }
 }
+
+template<class scalar_t>
+void rope_varlen_cpu(
+        scalar_t* rotated_queries,  // Output: [F, T, H, E]
+        const scalar_t* queries,    // Input: [T, H, E]
+        const float* cosines,       // Input: [F, T, R/2]
+        const float* sines,         // Input: [F, T, R/2]
+        int F,                      // num_turns
+        int T,                      // total_q_tokens
+        int H,                      // num_heads
+        int E,                      // head_dim
+        int RotaryE)                      // rotary_dim
+{
+    // Looping over [F, T, H]
+    for(int f = 0; f < F; ++f) {
+        for(int t = 0; t < T; ++t) {
+            for(int h = 0; h < H; ++h) {
+                const scalar_t* query_vec = queries + (t * H + h) * E;
+                scalar_t* result_vec = rotated_queries + ((f * T + t) * H + h) * E;
+
+                const int cos_sin_base_offset = (f * T + t) * RotaryE/2;
+                const float* cos_vec = cosines + cos_sin_base_offset;
+                const float* sin_vec = sines + cos_sin_base_offset;
+
+                // Part 1: Rotation for the first RotaryE dimensions
+                for (int e = 0; e < RotaryE / 2; e++) {
+                    const float x1 = query_vec[e];
+                    const float x2 = query_vec[e + RotaryE/2];
+
+                    result_vec[e] = x1 * cos_vec[e] - x2 * sin_vec[e];
+                    result_vec[e + RotaryE/2] = x2 * cos_vec[e] + x1 * sin_vec[e];
+                }
+
+                // Part 2: Pass-through for the remaining dimensions
+                for (int e = R; e < E; e++) {
+                    result_vec[e] = query_vec[e];
+                }
+            }
+        }
+    }
+}

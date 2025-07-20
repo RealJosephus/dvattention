@@ -6,8 +6,9 @@
 #include <torch/library.h>
 #include <vector>
 
-#include "cache.cuh"
 #include "kernels/kernel_v21.cuh"
+#include "kernels/paged_kernel_v21.cuh"
+#include "kernels/varlen_paged_kernel_v21.cuh"
 #include "rope.cuh"
 
 template<class scalar_t>
@@ -34,6 +35,45 @@ scalar_t* torch_get_pointer(at::Tensor& tensor) {
     } else {
         return nullptr;
     }
+}
+
+
+template<class scalar_t>
+void dvattn_rope_tpl(
+        at::Tensor& out, const at::Tensor& queries, const at::Tensor& cosines,
+        const at::Tensor& sines)
+{
+    // extract pointers and sizes
+    int F = out.size(0);
+    int W = out.size(1);
+    int Hq = out.size(2);
+    int S = out.size(3);
+    int E = out.size(4);
+    int RotaryE = cosines.size(3);
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(queries.is_contiguous());
+    TORCH_CHECK(cosines.is_contiguous());
+    TORCH_CHECK(sines.is_contiguous());
+
+    TORCH_CHECK_EQ(queries.size(0), W);
+    TORCH_CHECK_EQ(queries.size(1), Hq);
+    TORCH_CHECK_EQ(queries.size(2), S);
+    TORCH_CHECK_EQ(queries.size(3), E);
+
+    TORCH_CHECK_EQ(cosines.size(0), F);
+    TORCH_CHECK_EQ(cosines.size(1), W);
+    TORCH_CHECK_EQ(cosines.size(2), S);
+    TORCH_CHECK_EQ(cosines.size(3), RotaryE);
+
+    TORCH_CHECK_EQ(sines.size(0), F);
+    TORCH_CHECK_EQ(sines.size(1), W);
+    TORCH_CHECK_EQ(sines.size(2), S);
+    TORCH_CHECK_EQ(sines.size(3), RotaryE);
+
+    rope_gpu(torch_get_pointer<scalar_t>(out), torch_get_pointer<scalar_t>(queries),
+             torch_get_pointer<float>(cosines), torch_get_pointer<float>(sines),
+                     F, W, Hq, S, E, RotaryE);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<class scalar_t>
@@ -100,10 +140,11 @@ void dvattn_attention_tpl(
         frag_ptrs_host[F + f] = torch_get_pointer<scalar_t>(value_fragments[f]);
     }
 
-    C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice, stream));
+    C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice));
 
-    Shape shape = {F, W, Hq, Hkv, E, Ev, S, 0, 0, 0, nullptr, nullptr}; // block_size, max_blocks not used
-    C10_CUDA_CHECK(v21::dvattn_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, nullptr, nullptr, 0, fl_ptr,
+    // finally, launch
+    Shape shape = {F, W, Hq, Hkv, E, Ev, S};
+    C10_CUDA_CHECK(v21::dvattn_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
                           frag_ptrs, frag_ptrs + F, shape));
 }
 
@@ -111,155 +152,147 @@ template<class scalar_t>
 void dvattn_paged_attention_tpl(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
         const at::Tensor& cosines, const at::Tensor& sines,
-        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
-        const at::Tensor& value_cache, const at::Tensor& block_table)
+        const at::Tensor& fragment_lengths,
+        const at::Tensor& k_cache, const at::Tensor& v_cache,
+        const at::Tensor& block_tables)
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    int W = out.size(0);
+    int Hq = out.size(1);
+    int S = out.size(2); // S=1 for decode
+    int Ev = out.size(3);
+    TORCH_CHECK(out.is_contiguous());
     scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
-    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
-    const float* cos_ptr = cosines.const_data_ptr<float>();
-    const float* sin_ptr = sines.const_data_ptr<float>();
-    const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
-    const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
+
+    int F = locations.size(0);
+    TORCH_CHECK_EQ(locations.size(1), W);
+    TORCH_CHECK_EQ(locations.size(2), S);
+    TORCH_CHECK(locations.is_contiguous());
     const int* loc_ptr = locations.const_data_ptr<int>();
+
+    // The query from python is [W, Hq, S, E].
+    // The dvattn kernel expects a rotated query of shape [F, W, Hq, S, E].
+    // Let's create and rotate it.
+    auto rotated_queries = at::empty({F, W, Hq, S, queries.size(3)}, queries.options());
+    dvattn_rope_tpl<scalar_t>(rotated_queries, queries, cosines, sines);
+
+    const int E = rotated_queries.size(4);
+    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(rotated_queries);
+
+    TORCH_CHECK_EQ(fragment_lengths.size(0), F);
+    TORCH_CHECK(fragment_lengths.is_contiguous());
     const int* fl_ptr = fragment_lengths.const_data_ptr<int>();
-    const int* block_table_ptr = block_table.const_data_ptr<int>();
 
-    Shape shape = {
-        (int)locations.size(0),       // F
-        (int)out.size(0),             // W (batch_size)
-        (int)out.size(1),             // Hq
-        (int)key_cache.size(1),       // Hkv (per replica)
-        (int)queries.size(3),         // E. queries is [W, Hq, S, E]
-        (int)out.size(3),             // Ev
-        (int)out.size(2),             // S
-        (int)key_cache.size(2),       // block_size
-        (int)block_table.size(1),     // max_blocks_per_seq
-        0, nullptr, nullptr
-    };
+    TORCH_CHECK(k_cache.is_contiguous());
+    TORCH_CHECK(v_cache.is_contiguous());
+    TORCH_CHECK(block_tables.is_contiguous());
+    const scalar_t* k_cache_ptr = torch_get_pointer<scalar_t>(k_cache);
+    const scalar_t* v_cache_ptr = torch_get_pointer<scalar_t>(v_cache);
+    const int* block_tables_ptr = block_tables.const_data_ptr<int>();
 
-    const int rotary_dim = cosines.size(3);
+    int Hkv = k_cache.size(1);
+    int block_size = k_cache.size(2);
+    int max_blocks_per_seq = block_tables.size(1);
 
-    C10_CUDA_CHECK(v21::dvattn_paged_attention_gpu<scalar_t>(
-        out_ptr, (float)scale, loc_ptr, query_ptr, cos_ptr, sin_ptr, rotary_dim, fl_ptr,
-        key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
+    Shape shape = {F, W, Hq, Hkv, E, Ev, S, block_size, max_blocks_per_seq};
+
+    C10_CUDA_CHECK(paged_v21::dvattn_paged_attention_gpu(
+        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+        k_cache_ptr, v_cache_ptr, block_tables_ptr, shape));
+}
+
+template<class scalar_t>
+void dvattn_varlen_rope_tpl(
+        at::Tensor& rotated_queries, // [F, T, H, E]
+        const at::Tensor& queries,   // [T, H, E]
+        const at::Tensor& cosines,   // [F, T, R/2]
+        const at::Tensor& sines)     // [F, T, R/2]
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int F = rotated_queries.size(0);
+    const int T = rotated_queries.size(1);
+    const int H = rotated_queries.size(2);
+    const int E = rotated_queries.size(3);
+    const int R = cosines.size(2) * 2;
+
+    TORCH_CHECK(rotated_queries.is_contiguous());
+    TORCH_CHECK(queries.is_contiguous());
+    TORCH_CHECK(cosines.is_contiguous());
+    TORCH_CHECK(sines.is_contiguous());
+    TORCH_CHECK_EQ(cosines.scalar_type(), at::kFloat);
+    TORCH_CHECK_EQ(sines.scalar_type(), at::kFloat);
+
+    TORCH_CHECK_EQ(queries.dim(), 3);
+    TORCH_CHECK_EQ(queries.size(0), T);
+    TORCH_CHECK_EQ(queries.size(1), H);
+    TORCH_CHECK_EQ(queries.size(2), E);
+
+    TORCH_CHECK_EQ(cosines.dim(), 3);
+    TORCH_CHECK_EQ(cosines.size(0), F);
+    TORCH_CHECK_EQ(cosines.size(1), T);
+
+    TORCH_CHECK_EQ(sines.dim(), 3);
+    TORCH_CHECK_EQ(sines.size(0), F);
+    TORCH_CHECK_EQ(sines.size(1), T);
+    TORCH_CHECK_EQ(sines.size(2), R / 2);
+
+    rope_varlen_gpu(
+        torch_get_pointer<scalar_t>(rotated_queries),
+        torch_get_pointer<scalar_t>(queries),
+        torch_get_pointer<float>(cosines),
+        torch_get_pointer<float>(sines),
+        F, T, H, E, R);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<class scalar_t>
 void dvattn_varlen_paged_attention_tpl(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
         const at::Tensor& cosines, const at::Tensor& sines,
-        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
-        const at::Tensor& value_cache, const at::Tensor& block_table,
+        const at::Tensor& fragment_lengths,
+        const at::Tensor& k_cache, const at::Tensor& v_cache,
+        const at::Tensor& block_tables,
         const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_k)
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    const int T = queries.size(0); // Total tokens
+    const int Hq = queries.size(1);
+    const int E = queries.size(2);
+    const int F = locations.size(0);
+
+    auto rotated_queries = at::empty({F, T, Hq, E}, queries.options());
+    dvattn_varlen_rope_tpl<scalar_t>(rotated_queries, queries, cosines, sines);
+
+    TORCH_CHECK(out.is_contiguous());
     scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
-    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
-    const float* cos_ptr = cosines.const_data_ptr<float>();
-    const float* sin_ptr = sines.const_data_ptr<float>();
-    const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
-    const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
+
     const int* loc_ptr = locations.const_data_ptr<int>();
+    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(rotated_queries);
     const int* fl_ptr = fragment_lengths.const_data_ptr<int>();
-    const int* block_table_ptr = block_table.const_data_ptr<int>();
+
+    const scalar_t* k_cache_ptr = torch_get_pointer<scalar_t>(k_cache);
+    const scalar_t* v_cache_ptr = torch_get_pointer<scalar_t>(v_cache);
+    const int* block_tables_ptr = block_tables.const_data_ptr<int>();
     const int* cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr<int>();
     const int* cu_seqlens_k_ptr = cu_seqlens_k.const_data_ptr<int>();
 
+    const int W = cu_seqlens_q.size(0) - 1;
+    const int Hkv = k_cache.size(1);
+    const int Ev = v_cache.size(3);
+    const int block_size = k_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+
     Shape shape = {
-        (int)locations.size(0),       // F
-        (int)cu_seqlens_q.size(0) - 1,  // W (batch_size)
-        (int)out.size(1),             // Hq
-        (int)key_cache.size(1),       // Hkv
-        (int)queries.size(2),         // E (queries shape: [total_q, Hq, E])
-        (int)out.size(2),             // Ev
-        0,                            // S (not used in varlen)
-        (int)key_cache.size(2),       // block_size
-        (int)block_table.size(1),     // max_blocks_per_seq
-        (int)out.size(0),             // total_q_tokens
-        cu_seqlens_q_ptr,
-        cu_seqlens_k_ptr
+        F, W, Hq, Hkv, E, Ev, /*S=*/-1,
+        block_size, max_blocks_per_seq,
+        T, cu_seqlens_q_ptr, cu_seqlens_k_ptr
     };
 
-    const int rotary_dim = cosines.size(2);
-
-    C10_CUDA_CHECK(v21::dvattn_varlen_paged_attention_gpu<scalar_t>(
-        out_ptr, (float)scale, loc_ptr, query_ptr, cos_ptr, sin_ptr, rotary_dim, fl_ptr,
-        key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
-}
-
-template<class scalar_t>
-void copy_to_blocks_tpl(
-    const at::Tensor& key_states, const at::Tensor& value_states,
-    at::Tensor& key_cache, at::Tensor& value_cache,
-    const at::Tensor& block_table, const at::Tensor& seq_lengths)
-{
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    const int B = key_states.size(0);
-    const int Hkv = key_states.size(1);
-    const int S_new = key_states.size(2);
-    const int E = key_states.size(3);
-    const int Ev = value_states.size(3);
-    const int block_size = key_cache.size(2);
-    const int max_blocks = block_table.size(1);
-
-    Shape shape = {0, B, 0, Hkv, E, Ev, S_new, block_size, max_blocks, 0, nullptr, nullptr};
-
-    dim3 grid_dim(B, Hkv);
-    // Each thread handles one element in the embedding dimension
-    dim3 block_dim(S_new, std::max(E, Ev));
-
-    copy_to_blocks_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-        torch_get_pointer<scalar_t>(key_states),
-        torch_get_pointer<scalar_t>(value_states),
-        torch_get_pointer<scalar_t>(key_cache),
-        torch_get_pointer<scalar_t>(value_cache),
-        block_table.const_data_ptr<int>(),
-        seq_lengths.const_data_ptr<int>(),
-        shape
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-template<class scalar_t>
-void dvattn_rope_tpl(
-        at::Tensor& out, const at::Tensor& queries, const at::Tensor& cosines,
-        const at::Tensor& sines)
-{
-    // extract pointers and sizes
-    int F = out.size(0);
-    int W = out.size(1);
-    int Hq = out.size(2);
-    int S = out.size(3);
-    int E = out.size(4);
-    int RotaryE = cosines.size(3);
-    TORCH_CHECK(out.is_contiguous());
-    TORCH_CHECK(queries.is_contiguous());
-    TORCH_CHECK(cosines.is_contiguous());
-    TORCH_CHECK(sines.is_contiguous());
-
-    TORCH_CHECK_EQ(queries.size(0), W);
-    TORCH_CHECK_EQ(queries.size(1), Hq);
-    TORCH_CHECK_EQ(queries.size(2), S);
-    TORCH_CHECK_EQ(queries.size(3), E);
-
-    TORCH_CHECK_EQ(cosines.size(0), F);
-    TORCH_CHECK_EQ(cosines.size(1), W);
-    TORCH_CHECK_EQ(cosines.size(2), S);
-    TORCH_CHECK_EQ(cosines.size(3), RotaryE);
-
-    TORCH_CHECK_EQ(sines.size(0), F);
-    TORCH_CHECK_EQ(sines.size(1), W);
-    TORCH_CHECK_EQ(sines.size(2), S);
-    TORCH_CHECK_EQ(sines.size(3), RotaryE);
-
-    rope_gpu(torch_get_pointer<scalar_t>(out), torch_get_pointer<scalar_t>(queries),
-             torch_get_pointer<float>(cosines), torch_get_pointer<float>(sines),
-                     F, W, Hq, S, E, RotaryE);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_CUDA_CHECK(varlen_paged_v21::dvattn_varlen_paged_attention_gpu(
+        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+        k_cache_ptr, v_cache_ptr, block_tables_ptr, shape));
 }
 
 void dvattn_attention(
@@ -279,31 +312,32 @@ void dvattn_attention(
 void dvattn_paged_attention(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
         const at::Tensor& cosines, const at::Tensor& sines,
-        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
-        const at::Tensor& value_cache, const at::Tensor& block_table)
+        const at::Tensor& fragment_lengths,
+        const at::Tensor& k_cache, const at::Tensor& v_cache, const at::Tensor& block_tables)
 {
     if(out.dtype() == at::kHalf) {
-        dvattn_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables);
     } else if (out.dtype() == at::kFloat) {
-        dvattn_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables);
     } else if (out.dtype() == at::kBFloat16) {
-        dvattn_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table);
+        dvattn_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables);
     }
 }
 
 void dvattn_varlen_paged_attention(
         at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
         const at::Tensor& cosines, const at::Tensor& sines,
-        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
-        const at::Tensor& value_cache, const at::Tensor& block_table,
+        const at::Tensor& fragment_lengths,
+        const at::Tensor& k_cache, const at::Tensor& v_cache,
+        const at::Tensor& block_tables,
         const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_k)
 {
     if(out.dtype() == at::kHalf) {
-        dvattn_varlen_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<half>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables, cu_seqlens_q, cu_seqlens_k);
     } else if (out.dtype() == at::kFloat) {
-        dvattn_varlen_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<float>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables, cu_seqlens_q, cu_seqlens_k);
     } else if (out.dtype() == at::kBFloat16) {
-        dvattn_varlen_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
+        dvattn_varlen_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, cosines, sines, fragment_lengths, k_cache, v_cache, block_tables, cu_seqlens_q, cu_seqlens_k);
     }
 }
 
@@ -316,20 +350,6 @@ void dvattn_rope(
         dvattn_rope_tpl<float>(out, queries, cosines, sines);
     } else if (out.dtype() == at::kBFloat16) {
         dvattn_rope_tpl<nv_bfloat16>(out, queries, cosines, sines);
-    }
-}
-
-void copy_to_blocks(
-    const at::Tensor& key_states, const at::Tensor& value_states,
-    at::Tensor& key_cache, at::Tensor& value_cache,
-    const at::Tensor& block_table, const at::Tensor& seq_lengths)
-{
-    if(key_states.dtype() == at::kHalf) {
-        copy_to_blocks_tpl<half>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
-    } else if (key_states.dtype() == at::kFloat) {
-        copy_to_blocks_tpl<float>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
-    } else if (key_states.dtype() == at::kBFloat16) {
-        copy_to_blocks_tpl<nv_bfloat16>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
     }
 }
 
@@ -349,6 +369,21 @@ void dvattn_fused(
     }
     dvattn_rope(rotated_queries, queries, cosines, sines);
     dvattn_attention(out, scale, locations, rotated_queries, fragment_lengths, key_fragments_contiguous, val_fragments_contiguous);
+}
+
+void dvattn_varlen_rope(
+        at::Tensor& rotated_queries,
+        const at::Tensor& queries,
+        const at::Tensor& cosines,
+        const at::Tensor& sines)
+{
+    if(rotated_queries.dtype() == at::kHalf) {
+        dvattn_varlen_rope_tpl<half>(rotated_queries, queries, cosines, sines);
+    } else if (rotated_queries.dtype() == at::kFloat) {
+        dvattn_varlen_rope_tpl<float>(rotated_queries, queries, cosines, sines);
+    } else if (rotated_queries.dtype() == at::kBFloat16) {
+        dvattn_varlen_rope_tpl<nv_bfloat16>(rotated_queries, queries, cosines, sines);
+    }
 }
 
 extern "C" {
@@ -374,25 +409,22 @@ TORCH_LIBRARY(libdvatt, m) {
     tags.push_back(at::Tag::needs_fixed_stride_order);
     m.def("dvattn_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
           "Tensor fragment_lengths, Tensor[] key_fragments, Tensor[] value_fragments) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
+    m.def("dvattn_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
+          "Tensor cosines, Tensor sines, Tensor fragment_lengths, Tensor k_cache, Tensor v_cache, Tensor block_tables) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
     m.def("dvattn_rope(Tensor(a!) output, Tensor queries, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
     m.def("dvattn_fused(Tensor(a!) output, Tensor(b!) rq, float scale, Tensor locations, Tensor queries, "
           "Tensor fragment_lengths, Tensor[] key_fragments, Tensor[] value_fragments, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-
-    m.def("dvattn_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, Tensor cosines, Tensor sines, "
-          "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-    m.def("copy_to_blocks(Tensor key_states, Tensor value_states, Tensor(a!) key_cache, Tensor(b!) value_cache, "
-          "Tensor block_table, Tensor seq_lengths) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-    m.def("dvattn_varlen_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, Tensor cosines, Tensor sines, "
-          "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor cu_seqlens_q, Tensor cu_seqlens_k) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-
+    m.def("dvattn_varlen_rope(Tensor(a!) output, Tensor queries, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
+    m.def("dvattn_varlen_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
+          "Tensor cosines, Tensor sines, Tensor fragment_lengths, Tensor k_cache, Tensor v_cache, "
+          "Tensor block_tables, Tensor cu_seqlens_q, Tensor cu_seqlens_k) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
 }
 
 TORCH_LIBRARY_IMPL(libdvatt, CUDA, m) {
     m.impl("dvattn_sdpa", dvattn_attention);
+    m.impl("dvattn_paged_sdpa", dvattn_paged_attention);
     m.impl("dvattn_rope", dvattn_rope);
     m.impl("dvattn_fused", dvattn_fused);
-
-    m.impl("dvattn_paged_sdpa", dvattn_paged_attention);
-    m.impl("copy_to_blocks", copy_to_blocks);
+    m.impl("dvattn_varlen_rope", dvattn_varlen_rope);
     m.impl("dvattn_varlen_paged_sdpa", dvattn_varlen_paged_attention);
 }

@@ -191,8 +191,8 @@ void dvattn_paged_attention_tpl(
     const scalar_t* v_cache_ptr = torch_get_pointer<scalar_t>(v_cache);
     const int* block_tables_ptr = block_tables.const_data_ptr<int>();
 
-    int Hkv = k_cache.size(1);
-    int block_size = k_cache.size(2);
+    int block_size = k_cache.size(1);
+    int Hkv = k_cache.size(2);
     int max_blocks_per_seq = block_tables.size(1);
 
     Shape shape = {F, W, Hq, Hkv, E, Ev, S, block_size, max_blocks_per_seq};
@@ -279,9 +279,9 @@ void dvattn_varlen_paged_attention_tpl(
     const int* cu_seqlens_k_ptr = cu_seqlens_k.const_data_ptr<int>();
 
     const int W = cu_seqlens_q.size(0) - 1;
-    const int Hkv = k_cache.size(1);
+    const int block_size = k_cache.size(1);
+    const int Hkv = k_cache.size(2);
     const int Ev = v_cache.size(3);
-    const int block_size = k_cache.size(2);
     const int max_blocks_per_seq = block_tables.size(1);
 
     Shape shape = {

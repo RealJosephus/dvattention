@@ -103,21 +103,25 @@ __global__ __launch_bounds__(256) void dvattn_varlen_paged_attention_gpu_kernel2
             int offset_in_block = absolute_key_pos % shape.block_size;
             int physical_block_id = block_tables[w * shape.max_blocks_per_seq + block_in_seq_idx];
 
-            size_t k_head_stride = (size_t)shape.block_size * E;
-            const scalar_t* key_block_ptr = k_cache + (size_t)physical_block_id * shape.Hkv * k_head_stride + hkv * k_head_stride;
+            size_t k_block_stride = (size_t)shape.block_size * shape.Hkv * E;
+            size_t k_token_stride = (size_t)shape.Hkv * E;
+            const scalar_t* key_block_ptr = k_cache + (size_t)physical_block_id * k_block_stride;
+            const scalar_t* key_token_ptr = key_block_ptr + (size_t)offset_in_block * k_token_stride;
 
-            size_t v_head_stride = (size_t)shape.block_size * Ev;
-            const scalar_t* val_block_ptr = v_cache + (size_t)physical_block_id * shape.Hkv * v_head_stride + hkv * v_head_stride;
+            size_t v_block_stride = (size_t)shape.block_size * shape.Hkv * Ev;
+            size_t v_token_stride = (size_t)shape.Hkv * Ev;
+            const scalar_t* val_block_ptr = v_cache + (size_t)physical_block_id * v_block_stride;
+            const scalar_t* val_token_ptr = val_block_ptr + (size_t)offset_in_block * v_token_stride;
 
             for (int ee = 0; ee < VPH_k; ++ee) {
                 int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize;
                 __pipeline_memcpy_async(keys_lookahead + (stage * VPH_k + ee) * 256 + threadIdx.x,
-                                        key_block_ptr + offset_in_block * E + e, sizeof(full_vec_t));
+                                        key_token_ptr + hkv * E + e, sizeof(full_vec_t));
             }
             for (int ee = 0; ee < VPH_v; ++ee) {
                 int e = (ee * SubWarpSize + sub_warp.thread_rank()) * VecSize;
                  __pipeline_memcpy_async(vals_lookahead + (stage * VPH_v + ee) * 256 + threadIdx.x,
-                                        val_block_ptr + offset_in_block * Ev + e, sizeof(full_vec_t));
+                                        val_token_ptr + hkv * Ev + e, sizeof(full_vec_t));
             }
         };
 
